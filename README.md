@@ -18,6 +18,9 @@ The script is intended for system administrators who need to collect first-pass 
 - Windows feature state for IIS, ASP.NET, .NET, and WCF pieces
 - Installed Exact/.NET/WCF-related components
 - Local SQL Server clues from services and registry only
+- SQL server names parsed from Exact/Synergy connection strings, with credentials redacted
+- SQL Client Alias registry entries, if present
+- DNS/TCP reachability checks to parsed SQL server hosts, without logging into SQL Server
 - Recent relevant Application/System event log errors
 - Local HTTP checks against common Exact Synergy service endpoints
 
@@ -31,6 +34,7 @@ The script is read-only. It does not:
 - write to application folders
 - create or change Exact/Synergy records
 - require or use SQL credentials
+- query SQL databases
 
 The output can still contain server names, filesystem paths, app pool identities, installed component versions, and event log excerpts. Review the generated output before sharing it outside your organization.
 
@@ -44,11 +48,17 @@ See [LICENSE](LICENSE) for the full terms.
 
 ## Usage
 
-Run from an elevated PowerShell prompt on the Exact Synergy Enterprise webserver:
+Run from an elevated PowerShell prompt on the Exact Synergy Enterprise webserver. This is the recommended default command:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Collect-ExactSynergyDiagnostics.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Collect-ExactSynergyDiagnostics.ps1 -BaseUrl "http://server.example.local/Synergy"
 ```
+
+The script is non-interactive. It does not ask for usernames or passwords. If a module, path, permission, or endpoint is unavailable, the script records that in the output and continues.
+
+## Advanced Options
+
+Most administrators do not need these options. Use them only when the default command is not enough.
 
 If the Synergy path is not detected automatically:
 
@@ -56,10 +66,10 @@ If the Synergy path is not detected automatically:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Collect-ExactSynergyDiagnostics.ps1 -SynergyPath "C:\inetpub\wwwroot\Synergy"
 ```
 
-To include a specific Synergy base URL in the HTTP checks:
+To run without specifying a base URL:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Collect-ExactSynergyDiagnostics.ps1 -BaseUrl "http://server.example.local/Synergy"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Collect-ExactSynergyDiagnostics.ps1
 ```
 
 To collect more event log history:
@@ -72,6 +82,12 @@ If a smaller run is preferred:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Collect-ExactSynergyDiagnostics.ps1 -SkipEventLogs -SkipHttpChecks
+```
+
+To skip SQL network reachability checks:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Collect-ExactSynergyDiagnostics.ps1 -SkipSqlNetworkChecks
 ```
 
 ## Output

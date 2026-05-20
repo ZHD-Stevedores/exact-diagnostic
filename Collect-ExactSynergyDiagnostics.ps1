@@ -9,20 +9,25 @@ Licensed under the PolyForm Internal Use License 1.0.0. See LICENSE.
 .DESCRIPTION
 This script is intended for a live Exact Synergy Enterprise webserver. It only reads
 IIS, filesystem, registry/uninstall, and file metadata. It does not modify IIS,
-SQL Server, Exact configuration, or application files.
+SQL Server, Exact configuration, or application files. SQL checks only parse
+configuration clues and test DNS/TCP reachability; they do not log into SQL
+Server or query databases.
 
-Run on the Synergy webserver in an elevated PowerShell session if possible:
+Run on the Synergy webserver in an elevated PowerShell session if possible.
+Recommended:
 
-  powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Collect-ExactSynergyDiagnostics.ps1
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Collect-ExactSynergyDiagnostics.ps1 -BaseUrl "http://server.example.local/Synergy"
 
 Optional:
 
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Collect-ExactSynergyDiagnostics.ps1
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Collect-ExactSynergyDiagnostics.ps1 -SynergyPath "C:\inetpub\wwwroot\Synergy"
-  powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Collect-ExactSynergyDiagnostics.ps1 -BaseUrl "http://server.example.local/Synergy"
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Collect-ExactSynergyDiagnostics.ps1 -SinceHours 168
   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Collect-ExactSynergyDiagnostics.ps1 -SkipEventLogs -SkipHttpChecks
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Collect-ExactSynergyDiagnostics.ps1 -SkipSqlNetworkChecks
 
 The output file is written to the current directory unless -OutputPath is set.
+The script is non-interactive and never asks for usernames or passwords.
 #>
 
 [CmdletBinding()]
@@ -32,7 +37,8 @@ param(
     [string[]]$BaseUrl,
     [int]$SinceHours = 72,
     [switch]$SkipEventLogs,
-    [switch]$SkipHttpChecks
+    [switch]$SkipHttpChecks,
+    [switch]$SkipSqlNetworkChecks
 )
 
 Set-StrictMode -Version 2.0
@@ -88,6 +94,88 @@ function Shorten-Text {
     return $singleLine.Substring(0, $MaxLength) + " ...[truncated]"
 }
 
+function Get-ConnectionStringValue {
+    param(
+        [string]$ConnectionString,
+        [string[]]$Keys
+    )
+
+    if (-not $ConnectionString) { return $null }
+
+    foreach ($part in ($ConnectionString -split ';')) {
+        $pair = $part -split '=', 2
+        if ($pair.Count -ne 2) { continue }
+
+        $key = $pair[0].Trim()
+        $value = $pair[1].Trim().Trim('"').Trim("'")
+
+        foreach ($requestedKey in $Keys) {
+            if ($key -ieq $requestedKey) {
+                return $value
+            }
+        }
+    }
+
+    return $null
+}
+
+function Add-SqlServerCandidate {
+    param([string]$ServerName)
+
+    if (-not $ServerName) { return }
+
+    $clean = $ServerName.Trim().Trim('"').Trim("'")
+    if (-not $clean) { return }
+
+    foreach ($existing in $script:SqlServerCandidates) {
+        if ($existing -ieq $clean) { return }
+    }
+
+    $script:SqlServerCandidates.Add($clean) | Out-Null
+}
+
+function Split-SqlServerName {
+    param([string]$ServerName)
+
+    $result = New-Object PSObject -Property @{
+        Original = $ServerName
+        Host = $ServerName
+        Instance = ""
+        Port = ""
+        IsLocal = $false
+    }
+
+    if (-not $ServerName) { return $result }
+
+    $name = $ServerName.Trim()
+
+    if ($name.StartsWith("tcp:", [System.StringComparison]::OrdinalIgnoreCase)) {
+        $name = $name.Substring(4)
+    }
+
+    if ($name -match ',') {
+        $parts = $name -split ',', 2
+        $name = $parts[0]
+        $result.Port = $parts[1]
+    }
+
+    if ($name -match '\\') {
+        $parts = $name -split '\\', 2
+        $name = $parts[0]
+        $result.Instance = $parts[1]
+    }
+
+    if ($name -eq "." -or $name -ieq "(local)" -or $name -ieq "localhost" -or $name -ieq $env:COMPUTERNAME) {
+        $result.IsLocal = $true
+        $result.Host = $env:COMPUTERNAME
+    }
+    else {
+        $result.Host = $name
+    }
+
+    return $result
+}
+
 function Safe-Command {
     param(
         [string]$Name,
@@ -119,6 +207,7 @@ Write-Line "BaseUrl: $($BaseUrl -join ', ')"
 Write-Line "SinceHours: $SinceHours"
 Write-Line "SkipEventLogs: $SkipEventLogs"
 Write-Line "SkipHttpChecks: $SkipHttpChecks"
+Write-Line "SkipSqlNetworkChecks: $SkipSqlNetworkChecks"
 try {
     $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $currentPrincipal = New-Object Security.Principal.WindowsPrincipal($currentIdentity)
@@ -130,7 +219,7 @@ catch {
 
 Write-Section "PowerShell Command/Module Availability"
 Safe-Command "Command/module availability" {
-    foreach ($commandName in @("Get-CimInstance", "Get-WmiObject", "Get-WinEvent", "Invoke-WebRequest", "Get-WindowsFeature", "Get-WebHandler", "Get-WebConfiguration", "Get-WebConfigurationProperty")) {
+    foreach ($commandName in @("Get-CimInstance", "Get-WmiObject", "Get-WinEvent", "Invoke-WebRequest", "Get-WindowsFeature", "Get-WebHandler", "Get-WebConfiguration", "Get-WebConfigurationProperty", "Test-NetConnection", "Resolve-DnsName")) {
         $command = Get-Command $commandName -ErrorAction SilentlyContinue
         if ($command) {
             Write-Line "Command available: $commandName ($($command.CommandType))"
@@ -176,6 +265,7 @@ $script:iisAvailable = $false
 $candidatePaths = New-Object System.Collections.Generic.List[string]
 $script:iisLocationsToInspect = New-Object System.Collections.Generic.List[object]
 $script:DetectedSynergyPath = $null
+$script:SqlServerCandidates = New-Object System.Collections.Generic.List[string]
 
 function Add-IisLocationToInspect {
     param(
@@ -499,6 +589,59 @@ if ($SynergyPath) {
         }
     }
 
+    Write-Section "SQL Connection Clues From Config"
+    Safe-Command "SQL connection clues from config" {
+        $configs = @()
+        foreach ($pattern in @("web.config", "Exact*.config")) {
+            $configs += Get-ChildItem -Path $root -Recurse -File -Filter $pattern -ErrorAction SilentlyContinue
+        }
+
+        $configs = $configs | Sort-Object FullName -Unique
+        foreach ($config in $configs) {
+            $lineMatches = Select-String -Path $config.FullName -Pattern "connectionString|Data Source|Server=|Initial Catalog|Database=|Trusted_Connection|Integrated Security" -CaseSensitive:$false -ErrorAction SilentlyContinue
+            if (-not $lineMatches) { continue }
+
+            Write-Line "File: $($config.FullName)"
+            foreach ($match in $lineMatches) {
+                $line = $match.Line.Trim()
+                Write-Line ("  L{0}: {1}" -f $match.LineNumber, (Shorten-Text (Redact-Text $line) 1000))
+
+                $connectionString = $null
+                if ($line -match '(?i)connectionString\s*=\s*"([^"]+)"') {
+                    $connectionString = $matches[1]
+                }
+                elseif ($line -match "(?i)connectionString\s*=\s*'([^']+)'") {
+                    $connectionString = $matches[1]
+                }
+                else {
+                    $connectionString = $line
+                }
+
+                $server = Get-ConnectionStringValue -ConnectionString $connectionString -Keys @("Data Source", "Server", "Address", "Addr", "Network Address")
+                $database = Get-ConnectionStringValue -ConnectionString $connectionString -Keys @("Initial Catalog", "Database")
+                $integratedSecurity = Get-ConnectionStringValue -ConnectionString $connectionString -Keys @("Integrated Security", "Trusted_Connection")
+                $userId = Get-ConnectionStringValue -ConnectionString $connectionString -Keys @("User ID", "UID")
+
+                if ($server -or $database -or $integratedSecurity -or $userId) {
+                    $userIdText = ""
+                    if ($userId) { $userIdText = "[REDACTED]" }
+                    Write-Line "    Parsed SQL clue: server=$server database=$database integratedSecurity=$integratedSecurity userId=$userIdText"
+                    Add-SqlServerCandidate -ServerName $server
+                }
+            }
+        }
+
+        if ($script:SqlServerCandidates.Count -eq 0) {
+            Write-Line "No SQL server names parsed from config files."
+        }
+        else {
+            Write-Line "SQL server candidates parsed from config:"
+            foreach ($candidate in $script:SqlServerCandidates) {
+                Write-Line "  $candidate"
+            }
+        }
+    }
+
     Write-Section "ACL Summary"
     Safe-Command "ACL summary" {
         $aclTargets = @($root, $services)
@@ -598,6 +741,117 @@ Safe-Command "Local SQL registry login modes" {
 
                 Write-Line "Instance: $instanceName | Id: $instanceId | LoginMode: $loginMode ($loginModeText)"
             }
+    }
+}
+
+Write-Section "SQL Client Aliases (Read-Only)"
+Safe-Command "SQL client aliases" {
+    $aliasRoots = @(
+        "HKLM:\SOFTWARE\Microsoft\MSSQLServer\Client\ConnectTo",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\MSSQLServer\Client\ConnectTo"
+    )
+
+    foreach ($aliasRoot in $aliasRoots) {
+        Write-Line "Registry key: $aliasRoot"
+        if (-not (Test-Path $aliasRoot)) {
+            Write-Line "  Not found."
+            continue
+        }
+
+        $aliasProperties = Get-ItemProperty $aliasRoot -ErrorAction SilentlyContinue
+        $aliasProperties.PSObject.Properties |
+            Where-Object { $_.Name -notmatch '^PS' } |
+            ForEach-Object {
+                $aliasName = $_.Name
+                $aliasValue = [string]$_.Value
+                Write-Line "  Alias: $aliasName -> $aliasValue"
+                Add-SqlServerCandidate -ServerName $aliasName
+
+                $aliasParts = $aliasValue -split ','
+                if ($aliasParts.Count -ge 2) {
+                    Add-SqlServerCandidate -ServerName $aliasParts[1]
+                }
+            }
+    }
+}
+
+Write-Section "SQL Server Network Reachability (No Login)"
+if ($SkipSqlNetworkChecks) {
+    Write-Line "Skipped by -SkipSqlNetworkChecks."
+}
+else {
+    Safe-Command "SQL server network reachability" {
+        if ($script:SqlServerCandidates.Count -eq 0) {
+            Write-Line "No SQL server candidates were parsed from configuration, so no SQL network checks were run."
+        }
+
+        foreach ($candidate in $script:SqlServerCandidates) {
+            $parsed = Split-SqlServerName -ServerName $candidate
+            Write-Line "Candidate: $($parsed.Original) | Host: $($parsed.Host) | Instance: $($parsed.Instance) | Port: $($parsed.Port) | IsLocal: $($parsed.IsLocal)"
+
+            if (-not $parsed.Host) {
+                Write-Line "  No host parsed; skipping."
+                continue
+            }
+
+            try {
+                if (Get-Command Resolve-DnsName -ErrorAction SilentlyContinue) {
+                    $resolved = Resolve-DnsName -Name $parsed.Host -ErrorAction Stop |
+                        Where-Object { $_.IPAddress } |
+                        Select-Object -First 5 Name, Type, IPAddress
+                    if ($resolved) {
+                        Write-Line "  DNS:"
+                        $resolved | Format-Table -AutoSize | Out-String -Width 160 | Write-Line
+                    }
+                    else {
+                        Write-Line "  DNS: no IP records returned"
+                    }
+                }
+                else {
+                    $addresses = [System.Net.Dns]::GetHostAddresses($parsed.Host)
+                    Write-Line "  DNS: $($addresses -join ', ')"
+                }
+            }
+            catch {
+                Write-Line "  DNS failed: $($_.Exception.Message)"
+            }
+
+            $portsToCheck = New-Object System.Collections.Generic.List[int]
+            if ($parsed.Port) {
+                [int]$parsedPortNumber = 0
+                if ([int]::TryParse($parsed.Port, [ref]$parsedPortNumber)) {
+                    $portsToCheck.Add($parsedPortNumber) | Out-Null
+                }
+            }
+            else {
+                $portsToCheck.Add(1433) | Out-Null
+                if ($parsed.Instance) {
+                    $portsToCheck.Add(1434) | Out-Null
+                }
+            }
+
+            foreach ($port in $portsToCheck) {
+                try {
+                    if (Get-Command Test-NetConnection -ErrorAction SilentlyContinue) {
+                        $test = Test-NetConnection -ComputerName $parsed.Host -Port $port -InformationLevel Quiet -WarningAction SilentlyContinue
+                        Write-Line "  TCP $port reachable: $test"
+                    }
+                    else {
+                        $client = New-Object System.Net.Sockets.TcpClient
+                        $async = $client.BeginConnect($parsed.Host, $port, $null, $null)
+                        $success = $async.AsyncWaitHandle.WaitOne(3000, $false)
+                        if ($success) {
+                            $client.EndConnect($async)
+                        }
+                        $client.Close()
+                        Write-Line "  TCP $port reachable: $success"
+                    }
+                }
+                catch {
+                    Write-Line "  TCP $port check failed: $($_.Exception.Message)"
+                }
+            }
+        }
     }
 }
 
