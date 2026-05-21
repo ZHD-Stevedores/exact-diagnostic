@@ -300,9 +300,15 @@ function Test-LooksLikeSynergyPath {
         [string]$SiteName
     )
 
-    if (($AppPath -match '(?i)synergy|exact') -or
-        ($PhysicalPath -match '(?i)synergy|exact') -or
-        ($SiteName -match '(?i)synergy|exact')) {
+    if ($AppPath -match '(?i)synergy|exact') {
+        return $true
+    }
+
+    if ($PhysicalPath -match '(?i)synergy|exact') {
+        return $true
+    }
+
+    if ($SiteName -match '(?i)synergy|exact') {
         return $true
     }
 
@@ -310,7 +316,7 @@ function Test-LooksLikeSynergyPath {
         $expandedPath = [Environment]::ExpandEnvironmentVariables($PhysicalPath)
         $metadataSvc = Join-Path $expandedPath "Services\Exact.Metadata.svc"
         $entitySvc = Join-Path $expandedPath "Services\Exact.Entity.REST.svc"
-        if (Test-Path $metadataSvc -or Test-Path $entitySvc) {
+        if ((Test-Path $metadataSvc) -or (Test-Path $entitySvc)) {
             return $true
         }
     }
@@ -461,6 +467,8 @@ if (-not $SynergyPath) {
         $searchRoots = @(
             "C:\inetpub",
             "D:\inetpub",
+            "C:\SynEnt",
+            "D:\SynEnt",
             "C:\Program Files\Exact Software",
             "C:\Program Files (x86)\Exact Software",
             "C:\Program Files\Exact",
@@ -697,7 +705,12 @@ Safe-Command "Installed components" {
     foreach ($uninstallRoot in $uninstallRoots) {
         Get-ItemProperty $uninstallRoot -ErrorAction SilentlyContinue |
             Where-Object {
-                $_.DisplayName -match "(?i)Exact|Synergy|WCF Data Services|Data Services|\.NET"
+                $displayName = ""
+                if ($_.PSObject.Properties["DisplayName"] -and $_.DisplayName) {
+                    $displayName = [string]$_.DisplayName
+                }
+
+                $displayName -match "(?i)Exact|Synergy|WCF Data Services|Data Services|\.NET"
             } |
             Select-Object DisplayName, DisplayVersion, Publisher, InstallDate |
             Sort-Object DisplayName |
